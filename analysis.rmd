@@ -1,0 +1,191 @@
+---
+title: "PupilBio Challenge"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r Loading libraries,message=FALSE}
+library(readr)
+library(ggplot2)
+library(caTools)
+library(xgboost)
+library(caret)
+library(tibble)
+```
+
+
+Presets and reading input
+```{r read input files,message=FALSE}
+pmp <- read_csv("../../Downloads/PupilBioTest_PMP_revA.csv", col_names = T)
+cfdna <- pmp[pmp$Tissue == "cfDNA",]
+islet <- pmp[pmp$Tissue == "Islet",]
+```
+
+Function to calculate coverage of both tissues.
+
+```{r defined functions}
+calculate_coverage <- function(df){
+  to_return <- data.frame()
+  for (coord in unique(df$CpG_Coordinates)) {
+    each_cpg <- df[df$CpG_Coordinates == coord,]
+    per_sample_rep <- rowSums(each_cpg[,c(3:10)])
+    #Coverage
+    coverage <- sum(per_sample_rep)
+    #Coefficient of Variance
+    cv <- sd(per_sample_rep)/mean(per_sample_rep)*100
+    #Median
+    median <- median(per_sample_rep)
+    to_return <- rbind(to_return,data.frame(CpG_Coordinates = coord,
+                                            Coverage = coverage, 
+                                            Tissue = unique(each_cpg$Tissue),
+                                            Median = median, CV=cv))
+  }
+  return(to_return)
+}
+```
+
+
+Calculaion of said coverage
+```{r Get coverage,message=FALSE}
+#This is the actual code but my R keeps crashing so I'm reading the files directly
+#islet_coverage <- calculate_coverage(df = islet)
+#summary(islet_coverage)
+#write_csv(islet_coverage,"projects/side_project/islet_coverage.csv", col_names = T)
+#cfdna_coverage <- calculate_coverage(df = cfdna)
+#summary(cfdna_coverage)
+#write_csv(cfdna_coverage,"projects/side_project/cfDNA_coverage.csv", col_names = T)
+
+islet_coverage <- read_csv("../../islet_coverage.csv", col_names = T)
+cfdna_coverage <- read_csv("../../cfDNA_coverage.csv", col_names = T)
+summary(islet_coverage)
+summary(cfdna_coverage)
+```
+
+Based on the box plot, it is quite apparent that the cfDNA has much higher coverage than Islet cell.
+```{r Plotting}
+plot_df <- rbind(islet_coverage,cfdna_coverage)
+ggplot(plot_df, aes(x=Tissue, y=Coverage, fill=Tissue)) + geom_boxplot()
+ggplot(plot_df, aes(x=Coverage, fill = Tissue)) + geom_histogram()
+```
+
+Removing PMP with coverage above 400000 to better visualize the data (by removing the extremes)
+
+```{r Plotting 2}
+cfdna_coverage <- cfdna_coverage[cfdna_coverage$Coverage <= 400000,]
+plot_df <- rbind(islet_coverage,cfdna_coverage)
+ggplot(plot_df, aes(x=Tissue, y=Coverage, fill=Tissue)) + geom_boxplot()
+
+#Then further decreasing to 200000 to get a granular read.
+cfdna_coverage <- cfdna_coverage[cfdna_coverage$Coverage <= 200000,]
+plot_df <- rbind(islet_coverage,cfdna_coverage)
+ggplot(plot_df, aes(x=Tissue, y=Coverage, fill=Tissue)) + geom_boxplot()
+```
+
+A gradient boosting model was used to predict the classification of this dataset using xgboost. Because the dataset is heavily skewed towards cfDNA(0) with 75% of data to Islet cells' 25%, the imbalance is corrected by heavily penalizing errors in the minority class (Islet cell) xgboost (gradient boosting) and thus setting scale_pos_weight to 3.
+
+If I had the computational bandwidth, I would have done a k-fold cross validation.
+
+```{r Classification}
+#Splitting dataset into test:training in 25:75 ratio at random (and thus setting seed)
+pmp$Tissue <- ifelse(pmp$Tissue == "Islet",1,0)
+set.seed(234)
+split <- sample.split(pmp$Tissue, SplitRatio = 0.75)
+training_set <- subset(pmp[,c(3:10,13)], split == TRUE)
+training_set_pmp <- subset(pmp[,2], split == TRUE)
+test_set <- subset(pmp[,c(3:10,13)], split == FALSE) 
+test_set_pmp <- subset(pmp[,2], split == FALSE)
+
+# Prepare data matrices
+train_matrix <- as.matrix(training_set[,-9])
+test_matrix <- as.matrix(test_set[,-9])
+train_label <- training_set$Tissue
+test_label <- test_set$Tissue
+
+
+#Gradient Boosting model, prediction and associated statistics
+xgb_model <- xgboost(verbose = F,data = train_matrix, 
+                     label = train_label, objective = "binary:logistic", 
+                     nrounds = 100, scale_pos_weight = 3)
+xgb_predictions <- predict(xgb_model, test_matrix)
+xgb_rmse <- sqrt(mean((xgb_predictions - test_label)^2))
+print(paste("RMSE (XGBoost):", round(xgb_rmse, 2)))
+importance <- xgb.importance(feature_names = colnames(train_matrix), model = xgb_model)
+xgb.plot.importance(importance_matrix = importance)
+saveRDS(xgb_model,"xgb_n100_scaleposweight3.rds")
+```
+
+
+
+```{r Predictions}
+test_set$probability <- xgb_predictions
+test_set$prediction <- ifelse(test_set$probability > 0.5,1,0)
+test_set$Tissue <- factor(test_set$Tissue)
+test_set$prediction <- factor(test_set$prediction)
+test_set_pmp <- cbind(test_set_pmp,test_set)
+test_set_pmp$coverage <- rowSums(test_set_pmp[,c(2:9)])
+write_csv(test_set_pmp,"entire_test_set.csv", col_names = T)
+```
+
+
+```{r Confusion Matrix}
+confusion_mat <- confusionMatrix(test_set$Tissue,test_set$prediction)
+print(confusion_mat)
+tocsv <- data.frame(cbind(t(confusion_mat$overall),t(confusion_mat$byClass)))
+temp <- data.frame(t(tocsv))
+temp <- rownames_to_column(temp,"Statistic")
+names(temp)[2] <- "Value"
+write_csv(temp,file="Statistics_scaleweightpos3_n100.csv",col_names = T)
+write_csv(as.data.frame(confusion_mat$table),file="confusionMatrix_scaleweightpos3_n100.csv",col_names = T)
+rm(temp,tocsv)
+```
+Conclusion: As intended, the FP was minimized while allowing some FN.
+
+
+```{r Mean Variant Fraction Calculation}
+#This is the actual code, but because of memory issues I'm reading directly from the file
+#mean_variant_fraction <- data.frame()
+#for (coord in unique(pmp$CpG_Coordinates)) {
+#  each_pmp <- pmp[pmp$CpG_Coordinates == coord,]
+#  total_reads_per_variant <- colSums(each_pmp[,c(3:10)])
+#  total_reads <- sum(total_reads_per_variant)
+#  mvf <- total_reads_per_variant/total_reads
+#  each_pmp <- c(CpG_Coordinates = coord,mvf)
+#  mean_variant_fraction <- rbind(mean_variant_fraction,each_pmp)
+#}
+#colnames(mean_variant_fraction) <- c("CpG_Coordinates","X000","X001","X010","X011","X100","X101","X110","X111")
+#mean_variant_fraction[,c(2:9)] <- apply(mean_variant_fraction[,c(2:9)],2,as.numeric)
+#write_csv(mean_variant_fraction,"mean_variant_fraction.csv", col_names = T)
+mean_variant_fraction <- read_csv("mean_variant_fraction.csv", col_names = T)
+summary(mean_variant_fraction)
+```
+
+
+3a) Specificity is a measure of true negative (prediction accuracy of Tissue #2). In this case, since Tissue 2 has significantly low coverage, our ability to get a more accurate specificity of the minor class (at 25%) was far lower at 0.4
+
+
+3b) There are a total of 66023 unique CpG coordinates in the dataset. Since Tissue #2 (Islet cells) is the minority class at 25% of data, 25% of that is 16505 CpG coordinates. 1 million reads would mean Tissue #2 has approximately 250,000 reads. 
+
+Coverage_per_target = Total Reads/NUmber of Targets
+These 250,000 reads are distributed to across only 16505 PMP's would mean a depth of 15 per CpG. 
+
+Therefore the threshold is 15 reads per biomarker.
+
+
+3c) The specificity hypothesis
+```{r Hypothesis testing 3C}
+index <- head(order(test_set_pmp$probability,decreasing = T),n = 10)
+top10_cfdna <- test_set_pmp[index,]
+index <- head(order(test_set_pmp$probability,decreasing = F),n = 10)
+top10_islet <- test_set_pmp[index,]
+summary(top10_cfdna[,c(11,13)])
+summary(top10_islet[,c(11,13)])
+```
+
+As depicted by the boxplot earlier and the relative coverage of Islet cells and cfDNA, higher coverage leads to more certainity and thus higher specificity.
+
+
+
+
+
+
